@@ -1,0 +1,23 @@
+services:
+  telssh:
+    build: .
+    container_name: telssh
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/app/config.seed.yaml:ro
+      - bot-data:/app/data
+      # Uncomment if using SSH key authentication:
+      # - ~/.ssh/id_rsa:/app/.ssh/id_rsa:ro
+    environment:
+      - TZ=UTC
+    # Resource limits — very lightweight bot
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.25"
+        reservations:
+          memory: 16M
+
+volumes:
+  bot-data:

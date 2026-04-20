@@ -1,0 +1,33 @@
+# Telegram Bot Token from @BotFather
+bot_token: "YOUR_BOT_TOKEN_HERE"
+
+# Telegram user IDs authorized to use this bot
+# Get your ID by messaging @userinfobot on Telegram
+authorized_users:
+  - 123456789
+
+# Maximum characters per output message (Telegram limit is ~4096)
+max_output: 4000
+
+# VPS Servers
+servers:
+  - name: "my-vps"
+    host: "1.2.3.4"
+    port: 22
+    user: "root"
+    password: "your_password_here"
+    # key_path: "/root/.ssh/id_rsa"  # Use this instead of password for key-based auth
+
+  # - name: "my-vps-2"
+  #   host: "5.6.7.8"
+  #   port: 22
+  #   user: "ubuntu"
+  #   password: ""
+  #   key_path: "/home/user/.ssh/id_rsa"
+
+# Saved command snippets (managed via /save command)
+# saved_commands:
+#   - name: "deploy"
+#     command: "cd /app && git pull && docker compose up -d"
+#   - name: "logs"
+#     command: "tail -n 100 /var/log/syslog"
