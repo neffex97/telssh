@@ -1,6 +1,7 @@
 package sshmanager
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -23,6 +24,19 @@ type Session struct {
 	vps    config.VPS
 	mu     sync.Mutex
 	quit   chan struct{} // closed on cleanup to stop keepalive
+	cwd    string        // current working directory (empty = home)
+	cwdMu  sync.Mutex
+	shell  *ShellSession // persistent interactive shell (nil = not active)
+}
+
+// ShellSession holds a persistent interactive shell over SSH.
+type ShellSession struct {
+	session *ssh.Session
+	stdin   io.WriteCloser
+	reader  *bufio.Reader
+	mu      sync.Mutex
+	closed  bool
+	seq     int64
 }
 
 // Manager manages SSH sessions for multiple VPS servers per user.
@@ -42,6 +56,61 @@ func NewManager() *Manager {
 		active:   make(map[int64]string),
 		liveCxls: make(map[int64]context.CancelFunc),
 	}
+}
+
+// wrapCmd prefixes cmd with "cd <cwd> && " if a working directory is set.
+func (s *Session) wrapCmd(cmd string) string {
+	s.cwdMu.Lock()
+	dir := s.cwd
+	s.cwdMu.Unlock()
+	if dir == "" {
+		return cmd
+	}
+	return fmt.Sprintf("cd %s && %s", shellQuote(dir), cmd)
+}
+
+// updateCwd resolves the current working directory after command execution.
+// It runs "pwd" in a quick SSH session with the given command prefix.
+func (s *Session) updateCwd(cmd string) {
+	trimmed := strings.TrimSpace(cmd)
+	// Only bother resolving if the command might change directory
+	if !strings.Contains(trimmed, "cd ") && trimmed != "cd" && trimmed != "cd ~" {
+		return
+	}
+
+	// Handle bare "cd" or "cd ~" -> reset to home
+	if trimmed == "cd" || trimmed == "cd ~" {
+		s.cwdMu.Lock()
+		s.cwd = ""
+		s.cwdMu.Unlock()
+		return
+	}
+
+	// Resolve by running the command + pwd
+	wrapped := s.wrapCmd(cmd + " && pwd")
+	session, err := s.newSession()
+	if err != nil {
+		return
+	}
+	defer session.Close()
+
+	out, err := session.Output(wrapped)
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	resolved := strings.TrimSpace(lines[len(lines)-1])
+	if resolved != "" && strings.HasPrefix(resolved, "/") {
+		s.cwdMu.Lock()
+		s.cwd = resolved
+		s.cwdMu.Unlock()
+	}
+}
+
+// shellQuote wraps a string in single quotes for safe shell usage.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 func sshConnect(v config.VPS) (*ssh.Client, error) {
@@ -243,6 +312,7 @@ func (m *Manager) ExecStream(ctx context.Context, userID int64, cmd string, maxO
 
 // ExecStream runs a streaming command on the session.
 func (s *Session) ExecStream(ctx context.Context, cmd string, maxOutput int, interval time.Duration, timeout time.Duration, cb StreamCallback) error {
+	wrapped := s.wrapCmd(cmd)
 	session, err := s.newSession()
 	if err != nil {
 		return err
@@ -265,7 +335,7 @@ func (s *Session) ExecStream(ctx context.Context, cmd string, maxOutput int, int
 	session.Stderr = &syncWriter{w: lw, mu: &bufMu}
 
 	// Use Start + Wait so we surface start errors immediately
-	if err := session.Start(cmd); err != nil {
+	if err := session.Start(wrapped); err != nil {
 		return fmt.Errorf("start command: %w", err)
 	}
 
@@ -317,6 +387,7 @@ func (s *Session) ExecStream(ctx context.Context, cmd string, maxOutput int, int
 			} else {
 				cb(output, true)
 			}
+			go s.updateCwd(cmd)
 			return nil
 
 		case <-ticker.C:
@@ -356,6 +427,9 @@ func (m *Manager) IsConnected(userID int64) bool {
 
 // Close closes the session's SSH client and stops keepalive.
 func (s *Session) Close() {
+	// Close persistent shell first (outside the main lock)
+	s.closeShell()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.client != nil {
@@ -372,6 +446,7 @@ func (s *Session) Close() {
 
 // Exec runs a single command and returns the output.
 func (s *Session) Exec(cmd string, maxOutput int) (string, error) {
+	wrapped := s.wrapCmd(cmd)
 	session, err := s.newSession()
 	if err != nil {
 		return "", err
@@ -394,7 +469,7 @@ func (s *Session) Exec(cmd string, maxOutput int) (string, error) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- session.Run(cmd)
+		done <- session.Run(wrapped)
 	}()
 
 	select {
@@ -407,6 +482,8 @@ func (s *Session) Exec(cmd string, maxOutput int) (string, error) {
 		if output == "" && err != nil {
 			return "", fmt.Errorf("command failed: %w", err)
 		}
+		// Update cwd if command involved cd
+		go s.updateCwd(cmd)
 		return output, nil
 	case <-time.After(60 * time.Second):
 		_ = session.Signal(ssh.SIGKILL)
@@ -478,6 +555,7 @@ func (m *Manager) ExecCancel(ctx context.Context, userID int64, cmd string, maxO
 
 // ExecCancel runs a single command with cancellation support.
 func (s *Session) ExecCancel(ctx context.Context, cmd string, maxOutput int) (string, error) {
+	wrapped := s.wrapCmd(cmd)
 	session, err := s.newSession()
 	if err != nil {
 		return "", err
@@ -500,7 +578,7 @@ func (s *Session) ExecCancel(ctx context.Context, cmd string, maxOutput int) (st
 
 	done := make(chan error, 1)
 	go func() {
-		done <- session.Run(cmd)
+		done <- session.Run(wrapped)
 	}()
 
 	select {
@@ -526,6 +604,7 @@ func (s *Session) ExecCancel(ctx context.Context, cmd string, maxOutput int) (st
 		if output == "" && err != nil {
 			return "", fmt.Errorf("command failed: %w", err)
 		}
+		go s.updateCwd(cmd)
 		return output, nil
 	case <-time.After(120 * time.Second):
 		_ = session.Signal(ssh.SIGKILL)
@@ -559,12 +638,6 @@ func (m *Manager) WriteFile(userID int64, path, content string) error {
 	cmd := fmt.Sprintf("cat > %s << 'VPSADMIN_EOF'\n%s\nVPSADMIN_EOF", shellQuote(path), content)
 	_, err := s.Exec(cmd, 1000)
 	return err
-}
-
-// shellQuote wraps a path in single quotes for safe shell usage.
-func shellQuote(s string) string {
-	escaped := strings.ReplaceAll(s, "'", "'\\''")
-	return "'" + escaped + "'"
 }
 
 // ExecStreamRun runs a streaming command without registering as a live session.
@@ -661,6 +734,228 @@ func (m *Manager) StopAllLive() {
 		cancel()
 		delete(m.liveCxls, uid)
 	}
+}
+
+// --- Persistent Shell ---
+
+// OpenShell starts a persistent interactive shell for a user.
+func (m *Manager) OpenShell(userID int64) error {
+	m.mu.RLock()
+	s, ok := m.sessions[userID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("not connected to any server, use /connect first")
+	}
+	return s.openShell()
+}
+
+// CloseShell closes the persistent shell for a user.
+func (m *Manager) CloseShell(userID int64) {
+	m.mu.RLock()
+	s, ok := m.sessions[userID]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	s.closeShell()
+}
+
+// HasShell returns true if a persistent shell is active for a user.
+func (m *Manager) HasShell(userID int64) bool {
+	m.mu.RLock()
+	s, ok := m.sessions[userID]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	return s.hasShell()
+}
+
+// ExecInShell runs a command in the persistent shell.
+func (m *Manager) ExecInShell(userID int64, cmd string, maxOutput int) (string, error) {
+	m.mu.RLock()
+	s, ok := m.sessions[userID]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("not connected to any server, use /connect first")
+	}
+	return s.execInShell(cmd, maxOutput)
+}
+
+func (s *Session) openShell() error {
+	// Close existing shell if any
+	s.closeShell()
+
+	// Use PTY so stdout+stderr are merged into one stream
+	session, err := s.newSession()
+	if err != nil {
+		return fmt.Errorf("create session: %w", err)
+	}
+
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          0,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}
+	if err := session.RequestPty("xterm", 80, 200, modes); err != nil {
+		session.Close()
+		return fmt.Errorf("request pty: %w", err)
+	}
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		session.Close()
+		return fmt.Errorf("stdin pipe: %w", err)
+	}
+
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		session.Close()
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+
+	if err := session.Shell(); err != nil {
+		session.Close()
+		return fmt.Errorf("start shell: %w", err)
+	}
+
+	shell := &ShellSession{
+		session: session,
+		stdin:   stdin,
+		reader:  bufio.NewReaderSize(stdout, 64*1024),
+	}
+
+	// Consume the initial shell prompt/banner
+	marker := fmt.Sprintf("__TELSSH_READY_%d__", time.Now().UnixNano())
+	_, _ = fmt.Fprintf(stdin, "echo '%s'\n", marker)
+	shell.consumeUntilMarker(marker, 10*time.Second)
+
+	s.mu.Lock()
+	s.shell = shell
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Session) closeShell() {
+	s.mu.Lock()
+	shell := s.shell
+	s.shell = nil
+	s.mu.Unlock()
+
+	if shell != nil {
+		shell.close()
+	}
+}
+
+func (s *Session) hasShell() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shell != nil && !s.shell.closed
+}
+
+func (s *Session) execInShell(cmd string, maxOutput int) (string, error) {
+	s.mu.Lock()
+	shell := s.shell
+	s.mu.Unlock()
+
+	if shell == nil || shell.closed {
+		return "", fmt.Errorf("no active shell session, use /shell to start one")
+	}
+
+	return shell.exec(cmd, maxOutput)
+}
+
+// exec runs a command in the persistent shell and returns output.
+func (sh *ShellSession) exec(cmd string, maxOutput int) (string, error) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	if sh.closed {
+		return "", fmt.Errorf("shell session is closed")
+	}
+
+	sh.seq++
+	marker := fmt.Sprintf("__TELSSH_END_%d_%d__", time.Now().UnixNano(), sh.seq)
+
+	// Send the command, then echo the marker with exit code
+	// We use a subshell to capture the exit code
+	line := fmt.Sprintf("%s; __telssh_ec=$?; echo ''; echo '%s'\"_EXIT_${__telssh_ec}\"; unset __telssh_ec\n", cmd, marker)
+	if _, err := io.WriteString(sh.stdin, line); err != nil {
+		sh.closed = true
+		return "", fmt.Errorf("write to shell failed (shell may be dead): %w", err)
+	}
+
+	output, err := sh.consumeUntilMarker(marker, 120*time.Second)
+	if err != nil {
+		return "", err
+	}
+
+	// Clean up output
+	output = stripAnsi(output)
+	output = strings.TrimSpace(output)
+
+	if len(output) > maxOutput {
+		output = output[:maxOutput] + "\n... (truncated)"
+	}
+
+	return output, nil
+}
+
+// consumeUntilMarker reads from the shell output until the marker line appears.
+func (sh *ShellSession) consumeUntilMarker(marker string, timeout time.Duration) (string, error) {
+	var output strings.Builder
+	deadline := time.After(timeout)
+
+	for {
+		// Use a goroutine + channel to make ReadString cancellable by timeout
+		type lineResult struct {
+			line string
+			err  error
+		}
+		ch := make(chan lineResult, 1)
+		go func() {
+			line, err := sh.reader.ReadString('\n')
+			ch <- lineResult{line, err}
+		}()
+
+		select {
+		case <-deadline:
+			return output.String(), fmt.Errorf("command timed out after %v", timeout)
+		case res := <-ch:
+			if res.err != nil {
+				if res.err == io.EOF {
+					sh.closed = true
+					return output.String(), fmt.Errorf("shell session ended unexpectedly")
+				}
+				sh.closed = true
+				return output.String(), fmt.Errorf("read error: %w", res.err)
+			}
+
+			line := res.line
+			trimmed := strings.TrimSpace(line)
+
+			// Check if this line contains our end marker
+			if strings.HasPrefix(trimmed, marker) {
+				return output.String(), nil
+			}
+
+			// Skip lines that are just our command being echoed back
+			// (PTY echo is disabled but some shells still echo)
+			output.WriteString(line)
+		}
+	}
+}
+
+// close shuts down the persistent shell.
+func (sh *ShellSession) close() {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if sh.closed {
+		return
+	}
+	sh.closed = true
+	_ = sh.stdin.Close()
+	_ = sh.session.Close()
 }
 
 // CloseAll cleans up all sessions.
