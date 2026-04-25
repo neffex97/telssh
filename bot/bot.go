@@ -154,6 +154,8 @@ func (b *Bot) setCommands() {
 		{Command: "saved", Description: "Run saved commands"},
 		{Command: "delsave", Description: "Delete a saved command"},
 		{Command: "history", Description: "Command history"},
+		{Command: "shell", Description: "Open persistent shell session"},
+		{Command: "closeshell", Description: "Close persistent shell"},
 		{Command: "addserver", Description: "Add a new server"},
 		{Command: "editserver", Description: "Edit an existing server"},
 		{Command: "removeserver", Description: "Remove a server"},
@@ -289,6 +291,8 @@ func (b *Bot) registerHandlers() {
 	b.bh.HandleMessage(b.handleSaved, th.CommandEqual("saved"))
 	b.bh.HandleMessage(b.handleDelSave, th.CommandEqual("delsave"))
 	b.bh.HandleMessage(b.handleHistory, th.CommandEqual("history"))
+	b.bh.HandleMessage(b.handleShell, th.CommandEqual("shell"))
+	b.bh.HandleMessage(b.handleCloseShell, th.CommandEqual("closeshell"))
 	b.bh.HandleMessage(b.handleCancel, th.CommandEqual("cancel"))
 
 	// Callback handlers
@@ -357,6 +361,9 @@ func (b *Bot) handleHelp(ctx *th.Context, msg telego.Message) error {
 			"/saved — List &amp; run saved commands\n"+
 			"/delsave — Delete a saved command\n"+
 			"/history — Recent command history\n\n"+
+			"<b>Shell:</b>\n"+
+			"/shell — Open persistent shell (keeps cd, env, etc.)\n"+
+			"/closeshell — Close persistent shell\n\n"+
 			"<b>Management:</b>\n"+
 			"/addserver — Add a server\n"+
 			"/removeserver — Remove a server\n\n"+
@@ -492,13 +499,19 @@ func (b *Bot) handleStatus(ctx *th.Context, msg telego.Message) error {
 	active := b.ssh.ActiveServer(uid)
 	v, _ := b.cfg.GetServer(active)
 
+	shellStatus := "off"
+	if b.ssh.HasShell(uid) {
+		shellStatus = "🐚 active"
+	}
+
 	text := fmt.Sprintf(
 		"🟢 <b>Status:</b> Connected\n\n"+
 			"<b>Server:</b> %s\n"+
 			"<b>Host:</b> <code>%s:%d</code>\n"+
-			"<b>User:</b> <code>%s</code>\n\n"+
+			"<b>User:</b> <code>%s</code>\n"+
+			"<b>Shell:</b> %s\n\n"+
 			"Type any command to run it.",
-		escapeHTML(v.Name), escapeHTML(v.Host), v.Port, escapeHTML(v.User))
+		escapeHTML(v.Name), escapeHTML(v.Host), v.Port, escapeHTML(v.User), shellStatus)
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
@@ -575,6 +588,11 @@ func (b *Bot) executeCommand(ctx context.Context, chatID, userID int64, cmd stri
 
 	// Track in history
 	b.addHistory(userID, cmd)
+
+	// If persistent shell is active, run through it (synchronous, simpler)
+	if b.ssh.HasShell(userID) {
+		return b.executeInShell(ctx, chatID, userID, cmd)
+	}
 
 	active := b.ssh.ActiveServer(userID)
 	header := fmt.Sprintf("🖥 <b>%s</b> $ <code>%s</code>", escapeHTML(active), escapeHTML(cmd))
@@ -682,6 +700,47 @@ func (b *Bot) executeCommand(ctx context.Context, chatID, userID int64, cmd stri
 	}()
 
 	return nil
+}
+
+// executeInShell runs a command in the persistent shell session.
+func (b *Bot) executeInShell(ctx context.Context, chatID, userID int64, cmd string) error {
+	active := b.ssh.ActiveServer(userID)
+	header := fmt.Sprintf("🐚 <b>%s</b> $ <code>%s</code>", escapeHTML(active), escapeHTML(cmd))
+
+	b.typing(ctx, chatID)
+
+	output, err := b.ssh.ExecInShell(userID, cmd, b.cfg.MaxOutput)
+	if err != nil {
+		// If shell died, notify and close it
+		if !b.ssh.HasShell(userID) {
+			return b.send(ctx, chatID, header+"\n\n❌ Shell session ended: <code>"+escapeHTML(err.Error())+"</code>\nUse /shell to open a new one.")
+		}
+		return b.send(ctx, chatID, header+"\n\n❌ <pre>"+escapeHTML(err.Error())+"</pre>")
+	}
+
+	if output == "" {
+		output = "(no output)"
+	}
+
+	escapedOutput := escapeHTML(output)
+
+	if len(header)+len(escapedOutput)+20 <= 4096 {
+		return b.send(ctx, chatID, header+"\n<pre>"+escapedOutput+"</pre>")
+	} else if len(escapedOutput)+60 <= 4096 {
+		return b.send(ctx, chatID, header+"\n<blockquote expandable><pre>"+escapedOutput+"</pre></blockquote>")
+	} else {
+		_ = b.send(ctx, chatID, header)
+		chunks := splitOutput(output, 3900)
+		for i, chunk := range chunks {
+			esc := escapeHTML(chunk)
+			partLabel := ""
+			if len(chunks) > 1 {
+				partLabel = fmt.Sprintf("📄 Part %d/%d\n", i+1, len(chunks))
+			}
+			_ = b.send(ctx, chatID, partLabel+"<blockquote expandable><pre>"+esc+"</pre></blockquote>")
+		}
+		return nil
+	}
 }
 
 func (b *Bot) handleCancelRunCallback(ctx *th.Context, query telego.CallbackQuery) error {
@@ -1708,6 +1767,46 @@ func (b *Bot) handleHistoryCallback(ctx *th.Context, query telego.CallbackQuery)
 	}
 
 	return b.executeCommand(ctx, chatID, uid, h[idx])
+}
+
+// --- Persistent Shell ---
+
+func (b *Bot) handleShell(ctx *th.Context, msg telego.Message) error {
+	uid := msg.From.ID
+	chatID := msg.Chat.ID
+
+	if !b.ssh.IsConnected(uid) {
+		return b.send(ctx, chatID, "⚠️ Not connected. Use /connect first.")
+	}
+
+	if b.ssh.HasShell(uid) {
+		return b.send(ctx, chatID, "🐚 Shell is already active.\nUse /closeshell to close it.")
+	}
+
+	_ = b.send(ctx, chatID, "⏳ Opening persistent shell...")
+	if err := b.ssh.OpenShell(uid); err != nil {
+		return b.send(ctx, chatID, fmt.Sprintf("❌ Failed to open shell:\n<code>%s</code>", escapeHTML(err.Error())))
+	}
+
+	active := b.ssh.ActiveServer(uid)
+	return b.send(ctx, chatID,
+		fmt.Sprintf("🐚 <b>Persistent shell opened</b> on <b>%s</b>\n\n"+
+			"All your commands now run in the same shell session.\n"+
+			"State (cd, env vars, etc.) persists between commands.\n\n"+
+			"Use /closeshell to close and return to normal mode.",
+			escapeHTML(active)))
+}
+
+func (b *Bot) handleCloseShell(ctx *th.Context, msg telego.Message) error {
+	uid := msg.From.ID
+	chatID := msg.Chat.ID
+
+	if !b.ssh.HasShell(uid) {
+		return b.send(ctx, chatID, "ℹ️ No active shell session.")
+	}
+
+	b.ssh.CloseShell(uid)
+	return b.send(ctx, chatID, "🔒 Persistent shell closed. Back to normal mode.")
 }
 
 // --- Dangerous Command Confirmation ---
