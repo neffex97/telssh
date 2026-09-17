@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mymmrac/telego"
 	th "github.com/mymmrac/telego/telegohandler"
@@ -19,6 +20,21 @@ import (
 	"telssh/config"
 	"telssh/sshmanager"
 )
+
+type runEntry struct {
+	id     int64
+	cancel context.CancelFunc
+}
+
+type dangerEntry struct {
+	cmd    string
+	isLive bool
+}
+
+type editSession struct {
+	path      string
+	messageID int
+}
 
 // Bot wraps the Telegram bot with SSH management.
 type Bot struct {
@@ -33,11 +49,11 @@ type Bot struct {
 
 	// Running /run commands that can be cancelled
 	runMu   sync.Mutex
-	runCxls map[int64]context.CancelFunc // userID -> cancel func
+	runCxls map[int64]runEntry // userID -> runEntry
 
 	// Edit state: tracks users currently in /edit flow
-	editMu    sync.Mutex
-	editPaths map[int64]string // userID -> remote file path awaiting new content
+	editMu       sync.Mutex
+	editSessions map[int64]editSession // userID -> edit session
 
 	// Upload state: tracks users awaiting file upload
 	uploadMu    sync.Mutex
@@ -45,7 +61,7 @@ type Bot struct {
 
 	// Dangerous command confirmation
 	dangerMu   sync.Mutex
-	dangerCmds map[int64]string // userID -> pending dangerous command
+	dangerCmds map[int64]dangerEntry // userID -> pending dangerous command
 
 	// Command history (in-memory)
 	historyMu sync.Mutex
@@ -92,10 +108,10 @@ func New(cfg *config.Config) (*Bot, error) {
 		ssh:             sshmanager.NewManager(),
 		cancel:          cancel,
 		shutdown:        make(chan struct{}),
-		runCxls:         make(map[int64]context.CancelFunc),
-		editPaths:       make(map[int64]string),
+		runCxls:         make(map[int64]runEntry),
+		editSessions:    make(map[int64]editSession),
 		uploadPaths:     make(map[int64]string),
-		dangerCmds:      make(map[int64]string),
+		dangerCmds:      make(map[int64]dangerEntry),
 		history:         make(map[int64][]string),
 		editServerState: make(map[int64]*editServerSession),
 	}
@@ -128,8 +144,8 @@ func (b *Bot) Stop() {
 func (b *Bot) cancelAllRuns() {
 	b.runMu.Lock()
 	defer b.runMu.Unlock()
-	for uid, cancel := range b.runCxls {
-		cancel()
+	for uid, entry := range b.runCxls {
+		entry.cancel()
 		delete(b.runCxls, uid)
 	}
 }
@@ -542,14 +558,21 @@ func (b *Bot) handleText(ctx *th.Context, msg telego.Message) error {
 
 	// Check if user is in an /edit flow
 	b.editMu.Lock()
-	editPath, inEdit := b.editPaths[uid]
-	if inEdit {
-		delete(b.editPaths, uid)
-	}
+	editSess, inEdit := b.editSessions[uid]
 	b.editMu.Unlock()
 
 	if inEdit {
-		return b.saveEditedFile(ctx, chatID, uid, editPath, text)
+		// Require user to reply specifically to the edit prompt message to prevent accidental file overwrites
+		if msg.ReplyToMessage != nil && (editSess.messageID == 0 || msg.ReplyToMessage.MessageID == editSess.messageID) {
+			b.editMu.Lock()
+			delete(b.editSessions, uid)
+			b.editMu.Unlock()
+			return b.saveEditedFile(ctx, chatID, uid, editSess.path, text)
+		}
+		return b.send(ctx, chatID, fmt.Sprintf(
+			"⚠️ You have an active edit session for <code>%s</code>.\n\n"+
+				"Please <b>reply</b> to the file content message with your new content to save, or type /cancel to abort.",
+			escapeHTML(editSess.path)))
 	}
 
 	// Check if user is in an /editserver flow
@@ -558,6 +581,12 @@ func (b *Bot) handleText(ctx *th.Context, msg telego.Message) error {
 	if inEditServer && eSession.Field != "" {
 		delete(b.editServerState, uid)
 		b.editServerMu.Unlock()
+		if eSession.Field == "password" {
+			_ = b.bot.DeleteMessage(ctx, &telego.DeleteMessageParams{
+				ChatID:    tu.ID(chatID),
+				MessageID: msg.MessageID,
+			})
+		}
 		return b.applyEditServerField(ctx, chatID, eSession, text)
 	}
 	b.editServerMu.Unlock()
@@ -576,6 +605,39 @@ func (b *Bot) handleText(ctx *th.Context, msg telego.Message) error {
 	return b.executeCommand(ctx, chatID, uid, text)
 }
 
+func formatDraftText(prefix, output string) string {
+	full := prefix + "\n\n" + output
+	if len(full) <= 4000 {
+		return full
+	}
+	avail := 4000 - len(prefix) - 7
+	if avail < 200 {
+		if len(prefix) > 200 {
+			end := 197
+			for end > 0 && !utf8.RuneStart(prefix[end]) {
+				end--
+			}
+			prefix = prefix[:end] + "..."
+		}
+		avail = 4000 - len(prefix) - 7
+	}
+	if len(output) <= avail {
+		return prefix + "\n\n" + output
+	}
+	start := len(output) - avail
+	for start < len(output) && !utf8.RuneStart(output[start]) {
+		start++
+	}
+	res := prefix + "\n\n...\n" + output[start:]
+	if len(res) > 4096 {
+		res = res[len(res)-4096:]
+		for len(res) > 0 && !utf8.RuneStart(res[0]) {
+			res = res[1:]
+		}
+	}
+	return res
+}
+
 func (b *Bot) executeCommand(ctx context.Context, chatID, userID int64, cmd string) error {
 	if !b.ssh.IsConnected(userID) {
 		return b.send(ctx, chatID, "⚠️ Not connected. Use /connect first.")
@@ -583,7 +645,7 @@ func (b *Bot) executeCommand(ctx context.Context, chatID, userID int64, cmd stri
 
 	// Check dangerous command
 	if isDangerousCommand(cmd) {
-		return b.confirmDangerousCommand(ctx, chatID, userID, cmd)
+		return b.confirmDangerousCommand(ctx, chatID, userID, cmd, false)
 	}
 
 	// Track in history
@@ -613,14 +675,15 @@ func (b *Bot) executeCommand(ctx context.Context, chatID, userID int64, cmd stri
 
 	// Set up cancellable context
 	runCtx, cancel := context.WithCancel(context.Background())
+	runID := b.draftSeq.Add(1)
 	b.runMu.Lock()
 	if prev, exists := b.runCxls[userID]; exists {
-		prev()
+		prev.cancel()
 	}
-	b.runCxls[userID] = cancel
+	b.runCxls[userID] = runEntry{id: runID, cancel: cancel}
 	b.runMu.Unlock()
 
-	draftID := int(b.draftSeq.Add(1))
+	draftID := int(runID)
 
 	b.wg.Add(1)
 	go func() {
@@ -630,7 +693,9 @@ func (b *Bot) executeCommand(ctx context.Context, chatID, userID int64, cmd stri
 				log.Printf("executeCommand panic: %v", r)
 			}
 			b.runMu.Lock()
-			delete(b.runCxls, userID)
+			if entry, ok := b.runCxls[userID]; ok && entry.id == runID {
+				delete(b.runCxls, userID)
+			}
 			b.runMu.Unlock()
 			cancel()
 		}()
@@ -648,10 +713,7 @@ func (b *Bot) executeCommand(ctx context.Context, chatID, userID int64, cmd stri
 				}
 				// Stream via sendMessageDraft for real-time output
 				if output != "" && output != lastOutput && time.Since(lastDraft) > 200*time.Millisecond {
-					draftText := "🖥 " + active + " $ " + cmd + "\n\n" + output
-					if len(draftText) > 4000 {
-						draftText = "🖥 " + active + " $ " + cmd + "\n\n...\n" + output[len(output)-3800:]
-					}
+					draftText := formatDraftText("🖥 "+active+" $ "+cmd, output)
 					_ = b.bot.SendMessageDraft(bgCtx, &telego.SendMessageDraftParams{
 						ChatID:  chatID,
 						DraftID: draftID,
@@ -747,8 +809,8 @@ func (b *Bot) handleCancelRunCallback(ctx *th.Context, query telego.CallbackQuer
 	_ = b.answerText(ctx, query.ID, "✋ Cancelling...")
 	uid := query.From.ID
 	b.runMu.Lock()
-	if cancel, ok := b.runCxls[uid]; ok {
-		cancel()
+	if entry, ok := b.runCxls[uid]; ok {
+		entry.cancel()
 	}
 	b.runMu.Unlock()
 	return nil
@@ -780,6 +842,14 @@ func (b *Bot) handleLive(ctx *th.Context, msg telego.Message) error {
 		return b.send(ctx, chatID, "⚠️ Not connected. Use /connect first.")
 	}
 
+	if isDangerousCommand(cmd) {
+		return b.confirmDangerousCommand(ctx, chatID, uid, cmd, true)
+	}
+
+	return b.startLive(ctx, chatID, uid, cmd)
+}
+
+func (b *Bot) startLive(ctx context.Context, chatID, uid int64, cmd string) error {
 	if b.ssh.HasLive(uid) {
 		return b.send(ctx, chatID, "⚠️ A live session is already running. Stop it first.")
 	}
@@ -829,10 +899,7 @@ func (b *Bot) handleLive(ctx *th.Context, msg telego.Message) error {
 
 				// Stream via sendMessageDraft for true real-time output
 				if output != "" && time.Since(lastDraft) > 300*time.Millisecond {
-					draftText := "🔴 LIVE — " + active + " $ " + cmd + "\n\n" + output
-					if len(draftText) > 4000 {
-						draftText = "🔴 LIVE — " + active + " $ " + cmd + "\n\n...\n" + output[len(output)-3800:]
-					}
+					draftText := formatDraftText("🔴 LIVE — "+active+" $ "+cmd, output)
 					_ = b.bot.SendMessageDraft(bgCtx, &telego.SendMessageDraftParams{
 						ChatID:  chatID,
 						DraftID: draftID,
@@ -890,8 +957,8 @@ func (b *Bot) handleCancel(ctx *th.Context, msg telego.Message) error {
 	cancelled := false
 
 	b.editMu.Lock()
-	if _, inEdit := b.editPaths[uid]; inEdit {
-		delete(b.editPaths, uid)
+	if _, inEdit := b.editSessions[uid]; inEdit {
+		delete(b.editSessions, uid)
 		cancelled = true
 	}
 	b.editMu.Unlock()
@@ -919,11 +986,18 @@ func (b *Bot) handleCancel(ctx *th.Context, msg telego.Message) error {
 
 	// Also cancel running /run command if any
 	b.runMu.Lock()
-	if cancel, ok := b.runCxls[uid]; ok {
-		cancel()
+	if entry, ok := b.runCxls[uid]; ok {
+		entry.cancel()
+		delete(b.runCxls, uid)
 		cancelled = true
 	}
 	b.runMu.Unlock()
+
+	// Cancel running live session if any
+	if b.ssh.HasLive(uid) {
+		b.ssh.StopLive(uid)
+		cancelled = true
+	}
 
 	if cancelled {
 		return b.send(ctx, chatID, "🚫 Cancelled.")
@@ -953,44 +1027,60 @@ func (b *Bot) handleEdit(ctx *th.Context, msg telego.Message) error {
 
 	b.typing(ctx, chatID)
 
-	content, err := b.ssh.ReadFile(uid, path, b.cfg.MaxOutput)
+	// Read file up to 8000 bytes for editing in chat
+	rawBytes, _, err := b.ssh.DownloadFile(uid, path, 8000)
 	if err != nil {
 		return b.send(ctx, chatID, fmt.Sprintf(
 			"❌ Cannot read <code>%s</code>:\n<pre>%s</pre>",
 			escapeHTML(path), escapeHTML(err.Error())))
 	}
 
-	// Store the edit state
-	b.editMu.Lock()
-	b.editPaths[uid] = path
-	b.editMu.Unlock()
+	if len(rawBytes) >= 8000 {
+		return b.send(ctx, chatID, fmt.Sprintf(
+			"⚠️ File <code>%s</code> is too large to edit via Telegram chat (>8KB).\n\nPlease use /download and /upload instead.",
+			escapeHTML(path)))
+	}
+
+	if !utf8.Valid(rawBytes) {
+		return b.send(ctx, chatID, fmt.Sprintf(
+			"⚠️ File <code>%s</code> contains binary data or invalid UTF-8 characters and cannot be edited in chat.\n\nPlease use /download and /upload instead.",
+			escapeHTML(path)))
+	}
+
+	content := sshmanager.StripAnsi(string(rawBytes))
 
 	escaped := escapeHTML(content)
 	header := fmt.Sprintf("📝 <b>Editing:</b> <code>%s</code>\n\n", escapeHTML(path))
-	footer := "\n\n💬 <b>Send your updated content as next message to save.</b>\n" +
+	footer := "\n\n💬 <b>Reply to this message with your updated content to save.</b>\n" +
 		"Type /cancel to abort."
 
+	var promptMsg *telego.Message
 	if len(header)+len(escaped)+len(footer)+20 <= 4096 {
-		return b.send(ctx, chatID, header+"<pre>"+escaped+"</pre>"+footer)
-	}
-
-	// Long file: use expandable blockquote
-	if len(header)+len(escaped)+len(footer)+60 <= 4096 {
-		return b.send(ctx, chatID, header+"<blockquote expandable><pre>"+escaped+"</pre></blockquote>"+footer)
-	}
-
-	// Very long file: send header + chunks + footer
-	_ = b.send(ctx, chatID, header)
-	chunks := splitOutput(content, 3900)
-	for i, chunk := range chunks {
-		esc := escapeHTML(chunk)
-		label := ""
-		if len(chunks) > 1 {
-			label = fmt.Sprintf("📄 Part %d/%d\n", i+1, len(chunks))
+		promptMsg, _ = b.bot.SendMessage(ctx, tu.Message(tu.ID(chatID), header+"<pre>"+escaped+"</pre>"+footer).WithParseMode(telego.ModeHTML))
+	} else if len(header)+len(escaped)+len(footer)+60 <= 4096 {
+		promptMsg, _ = b.bot.SendMessage(ctx, tu.Message(tu.ID(chatID), header+"<blockquote expandable><pre>"+escaped+"</pre></blockquote>"+footer).WithParseMode(telego.ModeHTML))
+	} else {
+		_ = b.send(ctx, chatID, header)
+		chunks := splitOutput(content, 3900)
+		for i, chunk := range chunks {
+			esc := escapeHTML(chunk)
+			label := ""
+			if len(chunks) > 1 {
+				label = fmt.Sprintf("📄 Part %d/%d\n", i+1, len(chunks))
+			}
+			_ = b.send(ctx, chatID, label+"<blockquote expandable><pre>"+esc+"</pre></blockquote>")
 		}
-		_ = b.send(ctx, chatID, label+"<blockquote expandable><pre>"+esc+"</pre></blockquote>")
+		promptMsg, _ = b.bot.SendMessage(ctx, tu.Message(tu.ID(chatID), footer).WithParseMode(telego.ModeHTML))
 	}
-	return b.send(ctx, chatID, footer)
+
+	if promptMsg != nil {
+		b.editMu.Lock()
+		b.editSessions[uid] = editSession{path: path, messageID: promptMsg.MessageID}
+		b.editMu.Unlock()
+	} else {
+		return b.send(ctx, chatID, "❌ Failed to display file for editing.")
+	}
+	return nil
 }
 
 func (b *Bot) saveEditedFile(ctx context.Context, chatID, userID int64, path, content string) error {
@@ -1101,13 +1191,16 @@ func (b *Bot) handleAddServer(ctx *th.Context, msg telego.Message) error {
 		v.Host = hostPart
 	}
 
-	if len(parts) >= 5 {
-		port, err := strconv.Atoi(parts[4])
-		if err == nil {
+	if len(parts) == 5 {
+		if port, err := strconv.Atoi(parts[4]); err == nil {
+			v.Port = port
+		} else {
+			v.KeyPath = parts[4]
+		}
+	} else if len(parts) >= 6 {
+		if port, err := strconv.Atoi(parts[4]); err == nil {
 			v.Port = port
 		}
-	}
-	if len(parts) >= 6 {
 		v.KeyPath = parts[5]
 	}
 
@@ -1555,9 +1648,14 @@ func (b *Bot) handleDocument(ctx *th.Context, msg telego.Message) error {
 	req, _ := http.NewRequestWithContext(httpCtx, "GET", fileURL, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return b.send(ctx, chatID, "❌ Failed to download from Telegram: "+escapeHTML(err.Error()))
+		cleanErr := strings.ReplaceAll(err.Error(), b.cfg.BotToken, "[REDACTED_TOKEN]")
+		return b.send(ctx, chatID, "❌ Failed to download from Telegram: "+escapeHTML(cleanErr))
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return b.send(ctx, chatID, fmt.Sprintf("❌ Telegram download failed: HTTP %d", resp.StatusCode))
+	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 50*1024*1024))
 	if err != nil {
@@ -1760,13 +1858,19 @@ func (b *Bot) handleHistoryCallback(ctx *th.Context, query telego.CallbackQuery)
 
 	b.historyMu.Lock()
 	h := b.history[uid]
+	var cmd string
+	var found bool
+	if idx >= 0 && idx < len(h) {
+		cmd = h[idx]
+		found = true
+	}
 	b.historyMu.Unlock()
 
-	if idx < 0 || idx >= len(h) {
+	if !found {
 		return b.send(ctx, chatID, "❌ History entry not found.")
 	}
 
-	return b.executeCommand(ctx, chatID, uid, h[idx])
+	return b.executeCommand(ctx, chatID, uid, cmd)
 }
 
 // --- Persistent Shell ---
@@ -1817,7 +1921,7 @@ var dangerousPatterns = []string{
 	"mkfs",
 	"dd if=",
 	"> /dev/sd",
-	"chmod -R 777 /",
+	"chmod -r 777 /",
 	":(){ :|:& };:",
 	"reboot",
 	"shutdown",
@@ -1830,16 +1934,16 @@ var dangerousPatterns = []string{
 func isDangerousCommand(cmd string) bool {
 	lower := strings.ToLower(strings.TrimSpace(cmd))
 	for _, p := range dangerousPatterns {
-		if strings.Contains(lower, p) {
+		if strings.Contains(lower, strings.ToLower(p)) {
 			return true
 		}
 	}
 	return false
 }
 
-func (b *Bot) confirmDangerousCommand(ctx context.Context, chatID, userID int64, cmd string) error {
+func (b *Bot) confirmDangerousCommand(ctx context.Context, chatID, userID int64, cmd string, isLive bool) error {
 	b.dangerMu.Lock()
-	b.dangerCmds[userID] = cmd
+	b.dangerCmds[userID] = dangerEntry{cmd: cmd, isLive: isLive}
 	b.dangerMu.Unlock()
 
 	markup := tu.InlineKeyboard(
@@ -1862,7 +1966,7 @@ func (b *Bot) handleConfirmDangerousCallback(ctx *th.Context, query telego.Callb
 	chatID := chatIDFromCallback(query)
 
 	b.dangerMu.Lock()
-	cmd, ok := b.dangerCmds[uid]
+	entry, ok := b.dangerCmds[uid]
 	if ok {
 		delete(b.dangerCmds, uid)
 	}
@@ -1872,6 +1976,11 @@ func (b *Bot) handleConfirmDangerousCallback(ctx *th.Context, query telego.Callb
 		return b.send(ctx, chatID, "❌ No pending command found. It may have expired.")
 	}
 
+	if entry.isLive {
+		return b.startLive(ctx, chatID, uid, entry.cmd)
+	}
+
+	cmd := entry.cmd
 	// Track in history and execute
 	b.addHistory(uid, cmd)
 	active := b.ssh.ActiveServer(uid)
@@ -1891,21 +2000,27 @@ func (b *Bot) handleConfirmDangerousCallback(ctx *th.Context, query telego.Callb
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
+	runID := b.draftSeq.Add(1)
 	b.runMu.Lock()
 	if prev, exists := b.runCxls[uid]; exists {
-		prev()
+		prev.cancel()
 	}
-	b.runCxls[uid] = cancel
+	b.runCxls[uid] = runEntry{id: runID, cancel: cancel}
 	b.runMu.Unlock()
 
-	draftID := int(b.draftSeq.Add(1))
+	draftID := int(runID)
 
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
 		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("dangerous command panic: %v", r)
+			}
 			b.runMu.Lock()
-			delete(b.runCxls, uid)
+			if entry, ok := b.runCxls[uid]; ok && entry.id == runID {
+				delete(b.runCxls, uid)
+			}
 			b.runMu.Unlock()
 			cancel()
 		}()
@@ -1922,10 +2037,7 @@ func (b *Bot) handleConfirmDangerousCallback(ctx *th.Context, query telego.Callb
 					return true
 				}
 				if output != "" && output != lastOutput && time.Since(lastDraft) > 200*time.Millisecond {
-					draftText := "🖥 " + active + " $ " + cmd + "\n\n" + output
-					if len(draftText) > 4000 {
-						draftText = "🖥 " + active + " $ " + cmd + "\n\n...\n" + output[len(output)-3800:]
-					}
+					draftText := formatDraftText("🖥 "+active+" $ "+cmd, output)
 					_ = b.bot.SendMessageDraft(bgCtx, &telego.SendMessageDraftParams{
 						ChatID:  chatID,
 						DraftID: draftID,

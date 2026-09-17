@@ -67,20 +67,30 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// Save writes the current config state back to disk.
+// Save writes the current config state back to disk atomically.
 func (c *Config) Save() error {
-	c.Mu.RLock()
-	defer c.Mu.RUnlock()
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
 	return c.saveLocked()
 }
 
-// saveLocked writes config to disk. Caller must hold at least Mu.RLock.
+// saveLocked writes config to disk atomically. Caller must hold Mu.Lock.
 func (c *Config) saveLocked() error {
 	data, err := yaml.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	return os.WriteFile(c.filePath, data, 0600)
+
+	tmpPath := c.filePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return fmt.Errorf("write temp config: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, c.filePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename config: %w", err)
+	}
+	return nil
 }
 
 // AddServer adds a VPS to the config and saves.

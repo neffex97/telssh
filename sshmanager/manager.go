@@ -9,8 +9,10 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -35,7 +37,7 @@ type ShellSession struct {
 	stdin   io.WriteCloser
 	reader  *bufio.Reader
 	mu      sync.Mutex
-	closed  bool
+	closed  atomic.Bool
 	seq     int64
 }
 
@@ -66,17 +68,13 @@ func (s *Session) wrapCmd(cmd string) string {
 	if dir == "" {
 		return cmd
 	}
-	return fmt.Sprintf("cd %s && %s", shellQuote(dir), cmd)
+	return fmt.Sprintf("{ cd %s 2>/dev/null || cd ~; } && %s", shellQuote(dir), cmd)
 }
 
 // updateCwd resolves the current working directory after command execution.
-// It runs "pwd" in a quick SSH session with the given command prefix.
+// It only resolves pure "cd <dir>" commands to prevent re-executing compound commands with side effects.
 func (s *Session) updateCwd(cmd string) {
 	trimmed := strings.TrimSpace(cmd)
-	// Only bother resolving if the command might change directory
-	if !strings.Contains(trimmed, "cd ") && trimmed != "cd" && trimmed != "cd ~" {
-		return
-	}
 
 	// Handle bare "cd" or "cd ~" -> reset to home
 	if trimmed == "cd" || trimmed == "cd ~" {
@@ -86,8 +84,16 @@ func (s *Session) updateCwd(cmd string) {
 		return
 	}
 
-	// Resolve by running the command + pwd
-	wrapped := s.wrapCmd(cmd + " && pwd")
+	// Only resolve if the command starts with "cd " and contains NO operators/chaining/redirection
+	// to prevent re-executing compound commands with side effects (e.g. "cd /x && rm -rf y").
+	if !strings.HasPrefix(trimmed, "cd ") {
+		return
+	}
+	if strings.ContainsAny(trimmed, ";&|\n`$<>") {
+		return
+	}
+
+	wrapped := s.wrapCmd(trimmed + " && pwd")
 	session, err := s.newSession()
 	if err != nil {
 		return
@@ -108,8 +114,14 @@ func (s *Session) updateCwd(cmd string) {
 	}
 }
 
-// shellQuote wraps a string in single quotes for safe shell usage.
+// shellQuote wraps a string in single quotes for safe shell usage, expanding tilde.
 func shellQuote(s string) string {
+	if s == "~" {
+		return "\"$HOME\""
+	}
+	if strings.HasPrefix(s, "~/") {
+		return "\"$HOME\"/" + "'" + strings.ReplaceAll(s[2:], "'", "'\"'\"'") + "'"
+	}
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
@@ -117,12 +129,22 @@ func sshConnect(v config.VPS) (*ssh.Client, error) {
 	var authMethods []ssh.AuthMethod
 
 	if v.KeyPath != "" {
-		key, err := os.ReadFile(v.KeyPath)
+		keyPath := v.KeyPath
+		if strings.HasPrefix(keyPath, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				keyPath = filepath.Join(home, keyPath[2:])
+			}
+		}
+		key, err := os.ReadFile(keyPath)
 		if err == nil {
 			signer, err := ssh.ParsePrivateKey(key)
 			if err == nil {
 				authMethods = append(authMethods, ssh.PublicKeys(signer))
+			} else {
+				log.Printf("Failed to parse private key %s: %v", keyPath, err)
 			}
+		} else {
+			log.Printf("Failed to read private key %s: %v", keyPath, err)
 		}
 	}
 
@@ -131,7 +153,7 @@ func sshConnect(v config.VPS) (*ssh.Client, error) {
 	}
 
 	if len(authMethods) == 0 {
-		return nil, fmt.Errorf("no auth method for %s (set password or key_path)", v.Name)
+		return nil, fmt.Errorf("no auth method for %s (set password or valid key_path)", v.Name)
 	}
 
 	cfg := &ssh.ClientConfig{
@@ -159,12 +181,12 @@ func (s *Session) keepAlive() {
 			return
 		case <-t.C:
 			s.mu.Lock()
-			if s.client == nil {
-				s.mu.Unlock()
+			client := s.client
+			s.mu.Unlock()
+			if client == nil {
 				return
 			}
-			_, _, err := s.client.SendRequest("keepalive@openssh.com", true, nil)
-			s.mu.Unlock()
+			_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
 			if err != nil {
 				log.Printf("SSH keepalive failed for %s: %v", s.vps.Name, err)
 				return
@@ -206,13 +228,6 @@ func (s *Session) newSession() (*ssh.Session, error) {
 
 // Connect establishes an SSH session for a user to a specific VPS.
 func (m *Manager) Connect(userID int64, v config.VPS) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if old, ok := m.sessions[userID]; ok {
-		old.Close()
-	}
-
 	client, err := sshConnect(v)
 	if err != nil {
 		return err
@@ -221,8 +236,15 @@ func (m *Manager) Connect(userID int64, v config.VPS) error {
 	sess := &Session{client: client, vps: v, quit: make(chan struct{})}
 	go sess.keepAlive()
 
+	m.mu.Lock()
+	old, ok := m.sessions[userID]
 	m.sessions[userID] = sess
 	m.active[userID] = v.Name
+	m.mu.Unlock()
+
+	if ok && old != nil {
+		old.Close()
+	}
 	return nil
 }
 
@@ -463,9 +485,11 @@ func (s *Session) Exec(cmd string, maxOutput int) (string, error) {
 	}
 
 	var buf bytes.Buffer
+	var bufMu sync.Mutex
 	lw := &LimitedWriter{W: &buf, N: maxOutput + 500}
-	session.Stdout = lw
-	session.Stderr = lw
+	sw := &syncWriter{w: lw, mu: &bufMu}
+	session.Stdout = sw
+	session.Stderr = sw
 
 	done := make(chan error, 1)
 	go func() {
@@ -474,7 +498,10 @@ func (s *Session) Exec(cmd string, maxOutput int) (string, error) {
 
 	select {
 	case err := <-done:
-		output := strings.TrimSpace(buf.String())
+		bufMu.Lock()
+		raw := buf.String()
+		bufMu.Unlock()
+		output := strings.TrimSpace(raw)
 		output = stripAnsi(output)
 		if len(output) > maxOutput {
 			output = output[:maxOutput] + "\n... (truncated)"
@@ -487,20 +514,32 @@ func (s *Session) Exec(cmd string, maxOutput int) (string, error) {
 		return output, nil
 	case <-time.After(60 * time.Second):
 		_ = session.Signal(ssh.SIGKILL)
-		return buf.String(), fmt.Errorf("command timed out after 60s")
+		bufMu.Lock()
+		raw := buf.String()
+		bufMu.Unlock()
+		return raw, fmt.Errorf("command timed out after 60s")
 	}
 }
 
 // LimitedWriter stops writing after N bytes.
 type LimitedWriter struct {
-	W io.Writer
-	N int
-	n int
+	W              io.Writer
+	N              int
+	n              int
+	AbortOnLimit   bool
+	OnLimitReached func()
 }
 
 func (lw *LimitedWriter) Write(p []byte) (int, error) {
+	origLen := len(p)
 	if lw.n >= lw.N {
-		return len(p), nil
+		if lw.AbortOnLimit {
+			if lw.OnLimitReached != nil {
+				lw.OnLimitReached()
+			}
+			return 0, fmt.Errorf("size limit reached")
+		}
+		return origLen, nil
 	}
 	remaining := lw.N - lw.n
 	if len(p) > remaining {
@@ -508,7 +547,21 @@ func (lw *LimitedWriter) Write(p []byte) (int, error) {
 	}
 	n, err := lw.W.Write(p)
 	lw.n += n
-	return n, err
+	if err != nil {
+		return n, err
+	}
+	if lw.n >= lw.N && lw.AbortOnLimit {
+		if lw.OnLimitReached != nil {
+			lw.OnLimitReached()
+		}
+		return n, fmt.Errorf("size limit reached")
+	}
+	return origLen, nil
+}
+
+// StripAnsi removes ANSI escape codes from a string.
+func StripAnsi(s string) string {
+	return stripAnsi(s)
 }
 
 func stripAnsi(s string) string {
@@ -572,9 +625,11 @@ func (s *Session) ExecCancel(ctx context.Context, cmd string, maxOutput int) (st
 	}
 
 	var buf bytes.Buffer
+	var bufMu sync.Mutex
 	lw := &LimitedWriter{W: &buf, N: maxOutput + 500}
-	session.Stdout = lw
-	session.Stderr = lw
+	sw := &syncWriter{w: lw, mu: &bufMu}
+	session.Stdout = sw
+	session.Stderr = sw
 
 	done := make(chan error, 1)
 	go func() {
@@ -586,7 +641,10 @@ func (s *Session) ExecCancel(ctx context.Context, cmd string, maxOutput int) (st
 		_ = session.Signal(ssh.SIGINT)
 		time.Sleep(200 * time.Millisecond)
 		_ = session.Signal(ssh.SIGKILL)
-		output := strings.TrimSpace(buf.String())
+		bufMu.Lock()
+		raw := buf.String()
+		bufMu.Unlock()
+		output := strings.TrimSpace(raw)
 		output = stripAnsi(output)
 		if len(output) > maxOutput {
 			output = output[:maxOutput] + "\n... (truncated)"
@@ -596,7 +654,10 @@ func (s *Session) ExecCancel(ctx context.Context, cmd string, maxOutput int) (st
 		}
 		return output + "\n\n⚠️ Cancelled", nil
 	case err := <-done:
-		output := strings.TrimSpace(buf.String())
+		bufMu.Lock()
+		raw := buf.String()
+		bufMu.Unlock()
+		output := strings.TrimSpace(raw)
 		output = stripAnsi(output)
 		if len(output) > maxOutput {
 			output = output[:maxOutput] + "\n... (truncated)"
@@ -608,7 +669,10 @@ func (s *Session) ExecCancel(ctx context.Context, cmd string, maxOutput int) (st
 		return output, nil
 	case <-time.After(120 * time.Second):
 		_ = session.Signal(ssh.SIGKILL)
-		return buf.String(), fmt.Errorf("command timed out after 120s")
+		bufMu.Lock()
+		raw := buf.String()
+		bufMu.Unlock()
+		return raw, fmt.Errorf("command timed out after 120s")
 	}
 }
 
@@ -635,9 +699,34 @@ func (m *Manager) WriteFile(userID int64, path, content string) error {
 		return fmt.Errorf("not connected to any server, use /connect first")
 	}
 
-	cmd := fmt.Sprintf("cat > %s << 'VPSADMIN_EOF'\n%s\nVPSADMIN_EOF", shellQuote(path), content)
-	_, err := s.Exec(cmd, 1000)
-	return err
+	return s.writeFile(path, content)
+}
+
+func (s *Session) writeFile(path, content string) error {
+	session, err := s.newSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	session.Stdin = strings.NewReader(content)
+	wrapped := s.wrapCmd(fmt.Sprintf("cat > %s", shellQuote(path)))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(wrapped)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("write file failed: %w", err)
+		}
+		return nil
+	case <-time.After(30 * time.Second):
+		_ = session.Signal(ssh.SIGKILL)
+		return fmt.Errorf("write file timed out after 30s")
+	}
 }
 
 // ExecStreamRun runs a streaming command without registering as a live session.
@@ -698,11 +787,35 @@ func (s *Session) downloadFile(path string, maxBytes int) ([]byte, error) {
 	defer session.Close()
 
 	var buf bytes.Buffer
-	lw := &LimitedWriter{W: &buf, N: maxBytes}
+	lw := &LimitedWriter{
+		W:            &buf,
+		N:            maxBytes,
+		AbortOnLimit: true,
+		OnLimitReached: func() {
+			_ = session.Close()
+		},
+	}
 	session.Stdout = lw
 	session.Stderr = io.Discard
 
-	if err := session.Run(fmt.Sprintf("cat %s", shellQuote(path))); err != nil {
+	wrapped := s.wrapCmd(fmt.Sprintf("cat %s", shellQuote(path)))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(wrapped)
+	}()
+
+	select {
+	case err = <-done:
+	case <-time.After(60 * time.Second):
+		_ = session.Close()
+		return nil, fmt.Errorf("download timed out after 60s")
+	}
+
+	if buf.Len() >= maxBytes {
+		return nil, fmt.Errorf("file exceeds maximum allowed download size (%d MB)", maxBytes/(1024*1024))
+	}
+	if err != nil {
 		if buf.Len() > 0 {
 			return buf.Bytes(), nil
 		}
@@ -720,10 +833,23 @@ func (s *Session) uploadFile(path string, data []byte) error {
 	defer session.Close()
 
 	session.Stdin = bytes.NewReader(data)
-	if err := session.Run(fmt.Sprintf("cat > %s", shellQuote(path))); err != nil {
-		return fmt.Errorf("upload failed: %w", err)
+	wrapped := s.wrapCmd(fmt.Sprintf("cat > %s", shellQuote(path)))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(wrapped)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("upload failed: %w", err)
+		}
+		return nil
+	case <-time.After(60 * time.Second):
+		_ = session.Signal(ssh.SIGKILL)
+		return fmt.Errorf("upload timed out after 60s")
 	}
-	return nil
 }
 
 // StopAllLive cancels all running live sessions.
@@ -828,7 +954,10 @@ func (s *Session) openShell() error {
 	// Consume the initial shell prompt/banner
 	marker := fmt.Sprintf("__TELSSH_READY_%d__", time.Now().UnixNano())
 	_, _ = fmt.Fprintf(stdin, "echo '%s'\n", marker)
-	shell.consumeUntilMarker(marker, 10*time.Second)
+	if _, err := shell.consumeUntilMarker(marker, 10*time.Second); err != nil {
+		shell.close()
+		return fmt.Errorf("shell initialization timed out: %w", err)
+	}
 
 	s.mu.Lock()
 	s.shell = shell
@@ -850,7 +979,7 @@ func (s *Session) closeShell() {
 func (s *Session) hasShell() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.shell != nil && !s.shell.closed
+	return s.shell != nil && !s.shell.closed.Load()
 }
 
 func (s *Session) execInShell(cmd string, maxOutput int) (string, error) {
@@ -858,7 +987,7 @@ func (s *Session) execInShell(cmd string, maxOutput int) (string, error) {
 	shell := s.shell
 	s.mu.Unlock()
 
-	if shell == nil || shell.closed {
+	if shell == nil || shell.closed.Load() {
 		return "", fmt.Errorf("no active shell session, use /shell to start one")
 	}
 
@@ -870,18 +999,18 @@ func (sh *ShellSession) exec(cmd string, maxOutput int) (string, error) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
-	if sh.closed {
+	if sh.closed.Load() {
 		return "", fmt.Errorf("shell session is closed")
 	}
 
 	sh.seq++
 	marker := fmt.Sprintf("__TELSSH_END_%d_%d__", time.Now().UnixNano(), sh.seq)
 
-	// Send the command, then echo the marker with exit code
-	// We use a subshell to capture the exit code
-	line := fmt.Sprintf("%s; __telssh_ec=$?; echo ''; echo '%s'\"_EXIT_${__telssh_ec}\"; unset __telssh_ec\n", cmd, marker)
+	// Send the command wrapped in a subshell block so comments (#) do not swallow the marker,
+	// then echo the marker with exit code
+	line := fmt.Sprintf("{\n%s\n}; __telssh_ec=$?; echo ''; echo '%s'\"_EXIT_${__telssh_ec}\"; unset __telssh_ec\n", cmd, marker)
 	if _, err := io.WriteString(sh.stdin, line); err != nil {
-		sh.closed = true
+		sh.close()
 		return "", fmt.Errorf("write to shell failed (shell may be dead): %w", err)
 	}
 
@@ -920,14 +1049,14 @@ func (sh *ShellSession) consumeUntilMarker(marker string, timeout time.Duration)
 
 		select {
 		case <-deadline:
+			sh.close()
 			return output.String(), fmt.Errorf("command timed out after %v", timeout)
 		case res := <-ch:
 			if res.err != nil {
+				sh.close()
 				if res.err == io.EOF {
-					sh.closed = true
 					return output.String(), fmt.Errorf("shell session ended unexpectedly")
 				}
-				sh.closed = true
 				return output.String(), fmt.Errorf("read error: %w", res.err)
 			}
 
@@ -939,21 +1068,19 @@ func (sh *ShellSession) consumeUntilMarker(marker string, timeout time.Duration)
 				return output.String(), nil
 			}
 
-			// Skip lines that are just our command being echoed back
-			// (PTY echo is disabled but some shells still echo)
-			output.WriteString(line)
+			// Prevent unbounded memory allocation if output is infinite
+			if output.Len() < 50000 {
+				output.WriteString(line)
+			}
 		}
 	}
 }
 
 // close shuts down the persistent shell.
 func (sh *ShellSession) close() {
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	if sh.closed {
+	if sh.closed.Swap(true) {
 		return
 	}
-	sh.closed = true
 	_ = sh.stdin.Close()
 	_ = sh.session.Close()
 }

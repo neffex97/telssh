@@ -14,10 +14,10 @@ services:
     deploy:
       resources:
         limits:
-          memory: 64M
-          cpus: "0.25"
+          memory: 256M
+          cpus: "0.50"
         reservations:
-          memory: 16M
+          memory: 32M
 
 volumes:
   bot-data:

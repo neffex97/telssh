@@ -3,3 +3,4 @@ telssh
 *.exe
 *.bak
 .history/
+graphify-out/
